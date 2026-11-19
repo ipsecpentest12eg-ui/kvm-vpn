@@ -79,10 +79,9 @@ _MOVE_INTERVAL_NS = 16_000_000  # 60 Hz cap
 _pump_tid = 0
 _mouse_hook_fn = None
 _kb_hook_fn = None
+# Suppresses the SetCursorPos warp event that would otherwise be forwarded to the client
+_warping = False
 
-# FIX 1: send queue — hook callbacks never block on network I/O.
-# A dedicated sender thread drains the queue. This keeps hook callbacks
-# under the Windows global-hook timeout (~300 ms) even on a slow link.
 _send_q: _queue.Queue = _queue.Queue(maxsize=1024)
 _exit_event = threading.Event()
 
@@ -93,7 +92,7 @@ def get_remote() -> bool:
 
 
 def set_remote(val: bool, reason: str = ""):
-    global _remote_mode
+    global _remote_mode, _warping
     with _lock:
         changed = _remote_mode != val
         _remote_mode = val
@@ -101,8 +100,11 @@ def set_remote(val: bool, reason: str = ""):
         label = "ON" if val else "OFF"
         print(f"[SERVER] Remote mode {label}{' — ' + reason if reason else ''}")
         if val:
-            # Warp cursor to center so edge detection doesn't re-fire immediately
+            # Warp cursor to center so edge detection doesn't re-fire immediately.
+            # _warping suppresses the resulting WM_MOUSEMOVE from reaching the client.
+            _warping = True
             user32.SetCursorPos(_sw // 2, _sh // 2)
+            _warping = False
 
 
 def send_event(evt: dict):
@@ -114,7 +116,6 @@ def send_event(evt: dict):
 
 
 def _sender_thread():
-    # Runs outside the hook thread — safe to block on sendall here
     global _conn_sock
     while not _exit_event.is_set():
         try:
@@ -129,7 +130,9 @@ def _sender_thread():
             s.sendall((json.dumps(evt) + "\n").encode())
         except Exception:
             with _lock:
-                _conn_sock = None
+                # Only clear if the socket hasn't been replaced by a new connection
+                if _conn_sock is s:
+                    _conn_sock = None
             set_remote(False, "client disconnected")
 
 
@@ -138,6 +141,8 @@ def _sender_thread():
 def _mouse_proc(nCode: int, wParam: int, lParam: int) -> int:
     global _last_move_ns
     if nCode >= 0:
+        if _warping:
+            return user32.CallNextHookEx(0, nCode, wParam, lParam)
         info = ctypes.cast(lParam, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
         if not (info.flags & LLMHF_INJECTED):
             rm = get_remote()
@@ -164,7 +169,10 @@ def _mouse_proc(nCode: int, wParam: int, lParam: int) -> int:
                     now = time.monotonic_ns()
                     if now - _last_move_ns >= _MOVE_INTERVAL_NS:
                         _last_move_ns = now
-                        send_event({"t": "mm", "x": x, "y": y})
+                        # Send normalized 0.0-1.0 coords so client scales to its own resolution
+                        send_event({"t": "mm",
+                                    "nx": x / _sw if _sw > 0 else 0.0,
+                                    "ny": y / _sh if _sh > 0 else 0.0})
                     return 1
 
             elif wParam in (WM_LBUTTONDOWN, WM_LBUTTONUP,

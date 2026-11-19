@@ -69,11 +69,10 @@ _INPUT_SIZE = ctypes.sizeof(INPUT)
 
 # --- Input injection ---
 
-def send_mouse_move(x: int, y: int):
-    ax = int(x * 65535 / (_sw - 1)) if _sw > 1 else 0
-    ay = int(y * 65535 / (_sh - 1)) if _sh > 1 else 0
-    ax = max(0, min(65535, ax))
-    ay = max(0, min(65535, ay))
+def send_mouse_move(nx: float, ny: float):
+    # nx/ny are normalized 0.0-1.0 from server; scale to absolute coords (0-65535)
+    ax = max(0, min(65535, int(nx * 65535)))
+    ay = max(0, min(65535, int(ny * 65535)))
     inp = INPUT()
     inp.type = INPUT_MOUSE
     inp._input.mi.dx = ax
@@ -126,9 +125,11 @@ def set_clipboard(text: str):
     try:
         import win32clipboard
         win32clipboard.OpenClipboard()
-        win32clipboard.EmptyClipboard()
-        win32clipboard.SetClipboardText(text, win32clipboard.CF_UNICODETEXT)
-        win32clipboard.CloseClipboard()
+        try:
+            win32clipboard.EmptyClipboard()
+            win32clipboard.SetClipboardText(text, win32clipboard.CF_UNICODETEXT)
+        finally:
+            win32clipboard.CloseClipboard()
     except Exception:
         pass
 
@@ -136,7 +137,7 @@ def set_clipboard(text: str):
 def handle_event(evt: dict):
     t = evt.get("t")
     if t == "mm":
-        send_mouse_move(evt["x"], evt["y"])
+        send_mouse_move(evt["nx"], evt["ny"])
     elif t == "mk":
         send_mouse_button(evt["b"], evt["d"])
     elif t == "sc":
@@ -160,7 +161,9 @@ def run():
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            s.settimeout(10)
             s.connect((args.host, args.port))
+            s.settimeout(None)  # back to blocking after connect
             print(f"[CLIENT] Connected. Screen: {_sw}x{_sh}. Receiving input.")
             buf = ""
             while True:
@@ -169,10 +172,6 @@ def run():
                     print("[CLIENT] Server closed connection.")
                     break
                 buf += chunk
-                if len(buf) > _MAX_BUF:
-                    # Buffer bloat — likely malformed stream; reset
-                    print("[CLIENT] Warning: buffer overflow, resetting stream.")
-                    buf = ""
                 while "\n" in buf:
                     line, buf = buf.split("\n", 1)
                     line = line.strip()
@@ -181,6 +180,10 @@ def run():
                             handle_event(json.loads(line))
                         except (json.JSONDecodeError, KeyError):
                             pass
+                # Drop incomplete residue only if it grew unreasonably large
+                if len(buf) > _MAX_BUF:
+                    print("[CLIENT] Warning: oversized incomplete message, discarding.")
+                    buf = ""
         except KeyboardInterrupt:
             print("[CLIENT] Exiting.")
             sys.exit(0)
