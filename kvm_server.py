@@ -2,6 +2,7 @@ import argparse
 import ctypes
 from ctypes import wintypes
 import json
+import queue as _queue
 import socket
 import threading
 import time
@@ -58,9 +59,13 @@ WM_SYSKEYDOWN  = 0x0104
 WM_SYSKEYUP    = 0x0105
 WM_QUIT        = 0x0012
 
-LLMHF_INJECTED = 0x00000001  # event came from SendInput - skip to avoid re-capture loops
+LLMHF_INJECTED = 0x00000001
 
-HOOKPROC = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
+# VK codes that are always handled locally even in remote mode
+VK_SCROLL = 0x91  # ScrollLock — toggle remote mode off
+VK_PAUSE  = 0x13  # Pause/Break — emergency local exit
+
+HOOKPROC = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_int, wintypes.WPARAM, ctypes.c_lpvoid)
 
 # --- Shared state ---
 
@@ -72,8 +77,14 @@ _sh = user32.GetSystemMetrics(1)
 _last_move_ns = 0
 _MOVE_INTERVAL_NS = 16_000_000  # 60 Hz cap
 _pump_tid = 0
-_mouse_hook_fn = None  # keep HOOKPROC reference alive (ctypes GC issue)
+_mouse_hook_fn = None
 _kb_hook_fn = None
+
+# FIX 1: send queue — hook callbacks never block on network I/O.
+# A dedicated sender thread drains the queue. This keeps hook callbacks
+# under the Windows global-hook timeout (~300 ms) even on a slow link.
+_send_q: _queue.Queue = _queue.Queue(maxsize=1024)
+_exit_event = threading.Event()
 
 
 def get_remote() -> bool:
@@ -95,17 +106,32 @@ def set_remote(val: bool, reason: str = ""):
 
 
 def send_event(evt: dict):
-    global _conn_sock
-    with _lock:
-        s = _conn_sock
-    if s is None:
-        return
+    # FIX 1: non-blocking put; drop event if queue is full (heavy backpressure)
     try:
-        s.sendall((json.dumps(evt) + "\n").encode())
-    except Exception:
+        _send_q.put_nowait(evt)
+    except _queue.Full:
+        pass
+
+
+def _sender_thread():
+    # Runs outside the hook thread — safe to block on sendall here
+    global _conn_sock
+    while not _exit_event.is_set():
+        try:
+            evt = _send_q.get(timeout=0.2)
+        except _queue.Empty:
+            continue
         with _lock:
-            _conn_sock = None
-        set_remote(False, "client disconnected")
+            s = _conn_sock
+        if s is None:
+            continue
+        try:
+            s.sendall((json.dumps(evt) + "\n").encode())
+        except Exception:
+            with _lock:
+                _conn_sock = None
+            set_remote(False, "client disconnected")
+
 
 # --- Mouse low-level hook ---
 
@@ -139,7 +165,7 @@ def _mouse_proc(nCode: int, wParam: int, lParam: int) -> int:
                     if now - _last_move_ns >= _MOVE_INTERVAL_NS:
                         _last_move_ns = now
                         send_event({"t": "mm", "x": x, "y": y})
-                    return 1  # suppress local event
+                    return 1
 
             elif wParam in (WM_LBUTTONDOWN, WM_LBUTTONUP,
                             WM_RBUTTONDOWN, WM_RBUTTONUP,
@@ -156,7 +182,6 @@ def _mouse_proc(nCode: int, wParam: int, lParam: int) -> int:
 
             elif wParam == WM_MOUSEWHEEL:
                 if rm:
-                    # High word of mouseData = signed wheel delta (120 per click)
                     raw_delta = ctypes.c_int16(info.mouseData >> 16).value
                     send_event({"t": "sc", "dy": raw_delta})
                     return 1
@@ -170,16 +195,42 @@ def _kb_proc(nCode: int, wParam: int, lParam: int) -> int:
     if nCode >= 0:
         info = ctypes.cast(lParam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
         if not (info.flags & LLMHF_INJECTED):
+            vk = info.vkCode
+            down = wParam in (WM_KEYDOWN, WM_SYSKEYDOWN)
+
+            # FIX 2: emergency local keys — always processed locally, never forwarded.
+            # ScrollLock  → exit remote mode (keeps working as normal ScrollLock key)
+            # Pause/Break → emergency hard exit of the script
+            if vk == VK_SCROLL and down:
+                if get_remote():
+                    set_remote(False, "ScrollLock pressed")
+                return user32.CallNextHookEx(0, nCode, wParam, lParam)
+
+            if vk == VK_PAUSE and down:
+                print("[SERVER] Pause/Break pressed — force exit.")
+                _exit_event.set()
+                if _pump_tid:
+                    user32.PostThreadMessageW(_pump_tid, WM_QUIT, 0, 0)
+                sys.exit(0)
+
+            # FIX 3: let Ctrl+C reach Python even in remote mode so KeyboardInterrupt works
+            # Ctrl = VK_CONTROL (0x11) or VK_LCONTROL (0xA2) / VK_RCONTROL (0xA3)
+            if vk == 0x43 and down:  # 'C' key
+                ctrl_held = (user32.GetAsyncKeyState(0x11) & 0x8000) != 0
+                if ctrl_held:
+                    # Let it through — Python's Ctrl+C handler will catch it
+                    return user32.CallNextHookEx(0, nCode, wParam, lParam)
+
             if get_remote():
-                down = wParam in (WM_KEYDOWN, WM_SYSKEYDOWN)
                 send_event({
                     "t": "ks",
-                    "vk": info.vkCode,
+                    "vk": vk,
                     "sc": info.scanCode,
                     "ext": bool(info.flags & 0x01),
                     "d": 1 if down else 0,
                 })
                 return 1
+
     return user32.CallNextHookEx(0, nCode, wParam, lParam)
 
 
@@ -192,7 +243,7 @@ def _hook_thread():
 
     mfn = HOOKPROC(_mouse_proc)
     kfn = HOOKPROC(_kb_proc)
-    _mouse_hook_fn = mfn  # prevent GC
+    _mouse_hook_fn = mfn
     _kb_hook_fn = kfn
 
     mh = user32.SetWindowsHookExW(WH_MOUSE_LL, mfn, None, 0)
@@ -204,6 +255,7 @@ def _hook_thread():
 
     edge = args.switch_edge
     print(f"[SERVER] Hooks installed. Move cursor to {edge} edge to switch to client PC.")
+    print(f"[SERVER] Emergency exit: ScrollLock exits remote mode | Pause/Break force-quits")
 
     msg = wintypes.MSG()
     while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
@@ -244,6 +296,7 @@ def _accept_loop(port: int):
 
 # --- Entry point ---
 
+threading.Thread(target=_sender_thread, daemon=True).start()
 threading.Thread(target=_accept_loop, args=(args.port,), daemon=True).start()
 
 hook_t = threading.Thread(target=_hook_thread, daemon=True)
@@ -255,6 +308,7 @@ try:
         time.sleep(0.5)
 except KeyboardInterrupt:
     print("[SERVER] Exiting.")
+    _exit_event.set()
     if _pump_tid:
         user32.PostThreadMessageW(_pump_tid, WM_QUIT, 0, 0)
     sys.exit(0)
