@@ -65,7 +65,18 @@ LLMHF_INJECTED = 0x00000001
 VK_SCROLL = 0x91  # ScrollLock — toggle remote mode off
 VK_PAUSE  = 0x13  # Pause/Break — emergency local exit
 
-HOOKPROC = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_int, wintypes.WPARAM, ctypes.c_lpvoid)
+# Fix Win32 API return types before any call.
+# Default ctypes restype is c_int (4 bytes); on 64-bit Windows several APIs return
+# 8-byte values and truncation corrupts them.
+user32.SetWindowsHookExW.restype  = ctypes.c_void_p   # HHOOK = pointer (8B on x64)
+user32.CallNextHookEx.restype     = wintypes.LPARAM    # LRESULT = LONG_PTR (8B on x64)
+user32.GetAsyncKeyState.restype   = ctypes.c_short     # SHORT (2B, signed)
+user32.UnhookWindowsHookEx.restype = ctypes.c_int      # BOOL (4B, explicit for clarity)
+kernel32.GetCurrentThreadId.restype = wintypes.DWORD   # DWORD (4B, explicit)
+
+# HOOKPROC: return type must be LRESULT (LONG_PTR = 8B on x64), not c_long (4B).
+# lParam is LPARAM (LONG_PTR) used as a pointer to hook data — c_void_p is correct.
+HOOKPROC = ctypes.WINFUNCTYPE(wintypes.LPARAM, ctypes.c_int, wintypes.WPARAM, ctypes.c_void_p)
 
 # --- Shared state ---
 

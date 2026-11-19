@@ -8,6 +8,10 @@ import sys
 
 user32 = ctypes.windll.user32
 
+# Fix Win32 API return types (ctypes default c_int truncates 8-byte returns on x64)
+user32.SendInput.restype      = ctypes.c_uint   # UINT
+user32.GetSystemMetrics.restype = ctypes.c_int  # int (explicit for clarity)
+
 parser = argparse.ArgumentParser(description="KVM Client - receive input from server over TCP/VPN")
 parser.add_argument("--host", required=True, help="Server IP (e.g. 10.14.x.x from Surfshark)")
 parser.add_argument("--port", type=int, default=9876)
